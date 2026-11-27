@@ -1,132 +1,133 @@
-import { BACKEND_URL } from "@/lib/config";
-import axios from "axios";
+import { LIVE_WS_URL } from "@/lib/config";
+import { createLevelMeter, PcmPlayer, startMicCapture, type MicCapture } from "@/lib/audio";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
-import { Bot, Loader2, PhoneOff, User } from "lucide-react";
+import { Bot, Loader2, PhoneOff, User, Volume2 } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { VoiceOrb } from "./VoiceOrb";
 
-type Status = "connecting" | "live" | "ending";
+type Status = "connecting" | "live" | "ending" | "error";
 
-/** Attaches an analyser to a stream and returns a getter for its current 0..1 volume level. */
-function createLevelMeter(ctx: AudioContext, stream: MediaStream) {
-    const source = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 512;
-    analyser.smoothingTimeConstant = 0.8;
-    source.connect(analyser);
-    const data = new Uint8Array(analyser.fftSize);
-
-    return () => {
-        analyser.getByteTimeDomainData(data);
-        let sum = 0;
-        for (let i = 0; i < data.length; i++) {
-            const v = (data[i]! - 128) / 128;
-            sum += v * v;
-        }
-        const rms = Math.sqrt(sum / data.length);
-        // Boost and clamp so normal speech fills most of the range.
-        return Math.min(1, rms * 3.2);
-    };
-}
+const END_REASON_MESSAGES: Record<string, string> = {
+    replaced_by_new_connection: "This interview was opened in another tab or window.",
+    client_disconnected: "The connection to the interview server was lost.",
+};
 
 export function Interview() {
     const { interviewId } = useParams();
     const navigate = useNavigate();
 
     const [status, setStatus] = useState<Status>("connecting");
+    const [errorMessage, setErrorMessage] = useState("");
+    const [audioBlocked, setAudioBlocked] = useState(false);
     const [aiLevel, setAiLevel] = useState(0);
     const [userLevel, setUserLevel] = useState(0);
 
     // Resources we need to tear down on exit.
-    const pcRef = useRef<RTCPeerConnection | null>(null);
-    const socketRef = useRef<WebSocket | null>(null);
-    const recorderRef = useRef<MediaRecorder | null>(null);
+    const wsRef = useRef<WebSocket | null>(null);
+    const captureRef = useRef<MicCapture | null>(null);
+    const playerRef = useRef<PcmPlayer | null>(null);
     const userStreamRef = useRef<MediaStream | null>(null);
     const audioCtxRef = useRef<AudioContext | null>(null);
     const rafRef = useRef<number | null>(null);
+    // Flags read inside socket callbacks (state would be stale there).
+    const endingRef = useRef(false);
+    const failedRef = useRef(false);
 
     useEffect(() => {
         let cancelled = false;
+        endingRef.current = false;
+        failedRef.current = false;
+
+        function fail(message: string) {
+            if (cancelled || endingRef.current || failedRef.current) return;
+            failedRef.current = true;
+            cleanup();
+            setErrorMessage(message);
+            setStatus("error");
+        }
 
         (async () => {
-            const pc = new RTCPeerConnection();
-            pcRef.current = pc;
-
-            const audioCtx = new AudioContext();
-            audioCtxRef.current = audioCtx;
-            let aiMeter: (() => number) | null = null;
-            let userMeter: (() => number) | null = null;
-
-            // Play + meter the AI's audio.
-            const audioEl = document.createElement("audio");
-            audioEl.autoplay = true;
-            pc.ontrack = (e) => {
-                const stream = e.streams[0]!;
-                audioEl.srcObject = stream;
-                aiMeter = createLevelMeter(audioCtx, stream);
-            };
-
-            // Capture the user's microphone.
-            const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
+            // 1. Microphone first, so the permission prompt doesn't race the session.
+            const ms = await navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+            });
             if (cancelled) {
                 ms.getTracks().forEach((t) => t.stop());
                 return;
             }
             userStreamRef.current = ms;
-            userMeter = createLevelMeter(audioCtx, ms);
 
-            // Stream the mic to Deepgram for live transcription.
-            const socket = new WebSocket("wss://api.deepgram.com/v1/listen", [
-                "token",
-                //TODO: Lets create ephemereal api keys for the user and not put the prod key on the frontend
-                "",
-            ]);
-            socketRef.current = socket;
+            // 2. Audio graph: AI playback + meters.
+            const audioCtx = new AudioContext();
+            audioCtxRef.current = audioCtx;
+            const player = new PcmPlayer(audioCtx);
+            playerRef.current = player;
+            const aiMeter = createLevelMeter(audioCtx, player.node);
+            let userMeter: (() => number) | null = null;
 
-            socket.onopen = () => {
-                const mediaRecorder = new MediaRecorder(ms, { mimeType: "audio/webm" });
-                recorderRef.current = mediaRecorder;
-                mediaRecorder.start(250);
-                mediaRecorder.addEventListener("dataavailable", (event) => {
-                    if (socket.readyState === WebSocket.OPEN) socket.send(event.data);
-                });
-            };
+            // 3. Live session via our backend (the Gemini key never reaches the browser).
+            const ws = new WebSocket(`${LIVE_WS_URL}/api/v1/live/${interviewId}`);
+            ws.binaryType = "arraybuffer";
+            wsRef.current = ws;
 
-            socket.onmessage = (message) => {
-                const received = JSON.parse(message.data);
-                const transcript = received.channel?.alternatives[0]?.transcript;
-                if (transcript) {
-                    axios.post(`${BACKEND_URL}/api/v1/session/user/response/${interviewId}`, {
-                        message: transcript,
-                    });
+            ws.onmessage = async (event) => {
+                if (typeof event.data !== "string") {
+                    player.enqueue(event.data as ArrayBuffer); // AI voice, PCM16 24 kHz
+                    return;
+                }
+                const msg = JSON.parse(event.data);
+                switch (msg.type) {
+                    case "ready": {
+                        try {
+                            const capture = await startMicCapture(audioCtx, ms, (pcm) => {
+                                if (ws.readyState === WebSocket.OPEN) ws.send(pcm);
+                            });
+                            if (cancelled) return capture.stop();
+                            captureRef.current = capture;
+                            userMeter = createLevelMeter(audioCtx, capture.source);
+                        } catch (err: any) {
+                            return fail(`Could not start microphone streaming: ${err?.message ?? err}`);
+                        }
+                        // Autoplay policy: a direct page load may leave audio suspended until a click.
+                        if (audioCtx.state === "suspended") {
+                            await audioCtx.resume().catch(() => {});
+                            if (audioCtx.state === "suspended") setAudioBlocked(true);
+                        }
+                        setStatus("live");
+                        const tick = () => {
+                            setAiLevel(aiMeter());
+                            if (userMeter) setUserLevel(userMeter());
+                            rafRef.current = requestAnimationFrame(tick);
+                        };
+                        rafRef.current = requestAnimationFrame(tick);
+                        break;
+                    }
+                    case "interrupted":
+                        player.flush(); // candidate started talking: stop the AI immediately
+                        break;
+                    case "warning":
+                        toast(msg.message);
+                        break;
+                    case "error":
+                        fail(msg.message ?? "Something went wrong with the interview session.");
+                        break;
+                    case "ended":
+                        fail(END_REASON_MESSAGES[msg.reason] ?? "The interview session ended unexpectedly.");
+                        break;
                 }
             };
 
-            pc.addTrack(ms.getTracks()[0]!);
-
-            // SDP handshake with the backend.
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            const sdpResponse = await fetch(`${BACKEND_URL}/api/v1/session/${interviewId}`, {
-                method: "POST",
-                body: offer.sdp,
-                headers: { "Content-Type": "application/sdp" },
-            });
-            const answer = { type: "answer" as const, sdp: await sdpResponse.text() };
-            await pc.setRemoteDescription(answer);
-
-            if (cancelled) return;
-            setStatus("live");
-
-            // Single animation loop drives both volume meters.
-            const tick = () => {
-                if (aiMeter) setAiLevel(aiMeter());
-                if (userMeter) setUserLevel(userMeter());
-                rafRef.current = requestAnimationFrame(tick);
-            };
-            rafRef.current = requestAnimationFrame(tick);
-        })();
+            ws.onclose = () => fail("The connection to the interview server was lost.");
+        })().catch((err) => {
+            console.error("Interview setup failed:", err);
+            fail(
+                err?.name === "NotAllowedError"
+                    ? "Microphone access was denied. Allow mic access and reload the page."
+                    : err?.message ?? String(err)
+            );
+        });
 
         return () => {
             cancelled = true;
@@ -137,18 +138,45 @@ export function Interview() {
 
     function cleanup() {
         if (rafRef.current) cancelAnimationFrame(rafRef.current);
-        recorderRef.current?.state !== "inactive" && recorderRef.current?.stop();
-        socketRef.current?.close();
+        rafRef.current = null;
+        captureRef.current?.stop();
+        captureRef.current = null;
+        playerRef.current?.flush();
+        const ws = wsRef.current;
+        if (ws && ws.readyState <= WebSocket.OPEN) ws.close(1000, "client cleanup");
         userStreamRef.current?.getTracks().forEach((t) => t.stop());
-        pcRef.current?.getSenders().forEach((s) => s.track?.stop());
-        pcRef.current?.close();
         audioCtxRef.current?.close().catch(() => {});
     }
 
-    function endInterview() {
+    async function endInterview() {
+        endingRef.current = true;
         setStatus("ending");
+        captureRef.current?.stop();
+        captureRef.current = null;
+        playerRef.current?.flush();
+
+        // Ask the server to finish: it saves the remaining transcript, then closes the socket.
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            await new Promise<void>((resolve) => {
+                const timeout = setTimeout(resolve, 4000);
+                ws.addEventListener(
+                    "close",
+                    () => {
+                        clearTimeout(timeout);
+                        resolve();
+                    },
+                    { once: true },
+                );
+                ws.send(JSON.stringify({ type: "end" }));
+            });
+        }
         cleanup();
         navigate(`/result/${interviewId}`);
+    }
+
+    function enableAudio() {
+        audioCtxRef.current?.resume().then(() => setAudioBlocked(false)).catch(() => {});
     }
 
     const aiSpeaking = aiLevel > 0.06 && aiLevel >= userLevel;
@@ -174,14 +202,30 @@ export function Interview() {
                             }
                         />
                     </span>
-                    {status === "connecting" ? "Connecting…" : status === "ending" ? "Wrapping up…" : "Interview live"}
+                    {status === "connecting"
+                        ? "Connecting…"
+                        : status === "ending"
+                          ? "Wrapping up…"
+                          : status === "error"
+                            ? "Couldn't start"
+                            : "Interview live"}
                 </div>
                 <span className="text-sm text-muted-foreground">AI Interview</span>
             </header>
 
             {/* Stage */}
             <div className="flex flex-1 items-center justify-center px-6">
-                {status === "connecting" ? (
+                {status === "error" ? (
+                    <div className="flex max-w-md flex-col items-center gap-4 text-center">
+                        <p className="text-lg font-medium">We couldn't start your interview</p>
+                        <p className="rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                            {errorMessage}
+                        </p>
+                        <Button variant="outline" onClick={() => navigate("/")}>
+                            Back to start
+                        </Button>
+                    </div>
+                ) : status === "connecting" ? (
                     <div className="flex flex-col items-center gap-3 text-muted-foreground">
                         <Loader2 className="size-7 animate-spin" />
                         <p className="text-sm">Setting up your interview & microphone…</p>
@@ -209,7 +253,13 @@ export function Interview() {
             </div>
 
             {/* Controls */}
-            <footer className="flex justify-center px-6 py-8">
+            <footer className="flex justify-center gap-3 px-6 py-8">
+                {audioBlocked && status === "live" && (
+                    <Button variant="outline" size="lg" onClick={enableAudio} className="gap-2 rounded-full px-6">
+                        <Volume2 className="size-4" />
+                        Enable audio
+                    </Button>
+                )}
                 <Button
                     variant="destructive"
                     size="lg"
