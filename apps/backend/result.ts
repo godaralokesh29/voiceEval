@@ -1,6 +1,5 @@
 import { z } from "zod";
 import { GoogleGenAI } from "@google/genai";
-import { zodToJsonSchema } from "zod-to-json-schema";
 
 const ai = new GoogleGenAI({apiKey: process.env.GEMINI_API_KEY!});
 
@@ -23,12 +22,40 @@ const RESULT_PROMPT = `
     {{USER_TRANSCRIPT}}
 `
 
+// Primary model first; fall back when a model is overloaded (503), rate-limited (429) or unavailable (404).
+const SCORING_MODELS = [
+    process.env.GEMINI_MODEL || "gemini-3.5-flash",
+    ...(process.env.GEMINI_FALLBACK_MODELS ?? "gemini-flash-latest,gemini-flash-lite-latest").split(","),
+].map((m) => m.trim()).filter((m, i, all) => m && all.indexOf(m) === i);
+
 export async function calculateResult(messages: {type: "Assistant" | "User", message: string, createdAt: Date}[]) {
+    let lastError: unknown;
+    for (const model of SCORING_MODELS) {
+        try {
+            return await scoreWith(model, messages);
+        } catch (error: any) {
+            lastError = error;
+            if (![404, 429, 500, 503].includes(error?.status)) throw error;
+            console.warn(`Scoring model ${model} unavailable (${error.status}), trying next`);
+        }
+    }
+    throw lastError;
+}
+
+async function scoreWith(model: string, messages: {type: "Assistant" | "User", message: string, createdAt: Date}[]) {
     const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model,
         contents: RESULT_PROMPT.replace(`{{USER_TRANSCRIPT}}`, JSON.stringify(messages)),
         config: {
-            responseFormat: { text: { mimeType: "application/json", schema: zodToJsonSchema(outputSchema) } },
+            responseMimeType: "application/json",
+            responseJsonSchema: {
+                type: "object",
+                properties: {
+                    feedback: { type: "string", description: "Feedback for the user" },
+                    score: { type: "integer", description: "Score out of 10 for their interview" },
+                },
+                required: ["feedback", "score"],
+            },
         },
     });
     console.log(response.text!);
